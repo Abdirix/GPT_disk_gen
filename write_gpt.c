@@ -66,12 +66,32 @@ typedef struct {
     uint64_t name[36]; //UCS-2 (UTF-16 limited to code points 0x0000-0xFFFF)
  } __attribute__((packed)) Gpt_Partition_Entry;
 
+ //TODO: Find out why these const are written the way they are
+
+    // EFI System Partition GUID
+ const GUID ESP_GUID = { 0xC12A7328, 0xF81F, 0x11D2, 0xBA, 0x4B, 
+    {0x00, 0xA0, 0xC9, 0x3E, 0xC9, 0x3B } };
+
+    // (Microsoft) Basic Data Partition GUID
+ const GUID BASIC_DATA_GUID = { 0xEBD0A0A2, 0xB9E5, 0x4433, 0x87, 0xC0, 
+    { 0x68, 0xB6, 0xB7, 0x26, 0x99, 0xC7 } };
+
+
+ enum {
+    GPT_TABLE_ENTRY_SIZE = 128, //size of one partition entry in bytes
+    NUMBER_OF_GPT_TABLE_ENTRIES = 128, //number of partition entries in the GPT table
+    GPT_TABLE_SIZE = 16384, //Minimum size per UEFI spec 2.10, 128 entries * 128 bytes per entry
+    ALIGNMENT = 1048576 //1MB alignment for GPT tables
+
+ };
+
 char *image_name = "test.img";
 uint64_t lba_size = 512;
 uint64_t esp_size = 1024*1024*33;
 uint64_t data_size = 1024*1024*1;
 uint64_t image_size = 0;
-uint64_t esp_lbas, data_lbas, image_size_lbas;
+uint64_t esp_size_lbas, data_size_lbas, image_size_lbas; //Sizes of LBAs
+uint64_t align_lba = 0, esp_lba = 0, data_lba = 0; //Starting LBA values
 
 uint64_t bytes_to_lbas(const uint64_t bytes)
 {
@@ -86,6 +106,11 @@ void write_full_lba_size(FILE *image)
     {
         fwrite(zero_sector, sizeof(zero_sector), 1, image);
     }
+}
+
+uint64_t next_aligned_lba(uint64_t lba)
+{
+    return ((lba + align_lba - 1) / align_lba) * align_lba;
 }
 
 GUID new_guid(void)
@@ -211,6 +236,27 @@ bool write_gpts(FILE *image)
 
 
         // TODO: Fill out primary table with partitions
+        //GPT header will refer to this same table, from two different places on disk
+        Gpt_Partition_Entry gpt_table[NUMBER_OF_GPT_TABLE_ENTRIES] = 
+        //EFI System Partition
+        {
+            .partition_type_guid = ESP_GUID,
+            .unique_guid = new_guid(),
+            .starting_lba = esp_lba,
+            .ending_lba = esp_lba + esp_size_lbas - 1,
+            .attributes = 0,
+            .name = u"EFI SYSTEM",
+        },
+
+        //Basic Data Partition
+        {
+            .partition_type_guid = BASIC_DATA_GUID,
+            .unique_guid = new_guid(),
+            .starting_lba = data_lba,
+            .ending_lba = data_lba + data_size_lbas - 1,
+            .attributes = 0,
+            .name = u"BASIC DATA",
+        },
 
         // TODO: Fill out primary header CRC32
 
@@ -242,13 +288,20 @@ int main(void)
     //Set sizes
     image_size = esp_size + data_size + (1024*1024); // Add some extra padding for GPT
     image_size_lbas = bytes_to_lbas(image_size);
+    align_lba = ALIGNMENT / lba_size;
+    esp_lba = align_lba; //ESP starts after alignment
+    esp_size_lbas = bytes_to_lbas(esp_size);
+    data_size_lbas = bytes_to_lbas(data_size);
+    data_lba = next_aligned_lba(esp_lba + esp_size_lbas); //Data partition starts after ESP
+
+    
 
     //Seed rand()
     srand(time(NULL));
 
     if (!write_mbr(image))
     {
-        fprintf(stderr, "Error: could nto protective MBR for file %s\n", image_name);
+        fprintf(stderr, "Error: could not write protective MBR for file %s\n", image_name);
         return EXIT_FAILURE;
     }
 
