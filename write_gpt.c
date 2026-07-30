@@ -48,7 +48,7 @@ typedef struct {
     uint64_t first_usable_lba;
     uint64_t last_usable_lba;
     GUID disk_guid; //pseudorandomly generated Version 4 variant 2 GUID
-    uint64_t partition_entry_lba;
+    uint64_t partition_table_lba;
     uint32_t number_of_entries;
     uint32_t size_of_entry;
     uint32_t partition_table_crc32;
@@ -63,7 +63,7 @@ typedef struct {
     uint64_t starting_lba;
     uint64_t ending_lba;
     uint64_t attributes;
-    uint64_t name[36]; //UCS-2 (UTF-16 limited to code points 0x0000-0xFFFF)
+    char16_t name[36]; //UCS-2 (UTF-16 limited to code points 0x0000-0xFFFF)
  } __attribute__((packed)) Gpt_Partition_Entry;
 
  //TODO: Find out why these const are written the way they are
@@ -227,7 +227,7 @@ bool write_gpts(FILE *image)
         .first_usable_lba = 1+ 1 + 32, //MBR + GPT header + primary GPT table
         .last_usable_lba = image_size_lbas - 1 - 1 - 32, //TODO: Calculate this properly
         .disk_guid = new_guid(), //TODO : Generate a random GUID
-        .partition_entry_lba = 2, //GPT table comes after GPT header
+        .partition_table_lba = 2, //GPT table comes after GPT header
         .number_of_entries = 128, //TODO: Calculate this properly
         .size_of_entry = 128, //TODO: Calculate this properly
         .partition_table_crc32 = 0, //Will be calculated later
@@ -238,6 +238,7 @@ bool write_gpts(FILE *image)
         // TODO: Fill out primary table with partitions
         //GPT header will refer to this same table, from two different places on disk
         Gpt_Partition_Entry gpt_table[NUMBER_OF_GPT_TABLE_ENTRIES] = 
+        {
         //EFI System Partition
         {
             .partition_type_guid = ESP_GUID,
@@ -257,18 +258,50 @@ bool write_gpts(FILE *image)
             .attributes = 0,
             .name = u"BASIC DATA",
         },
+    };
 
         // TODO: Fill out primary header CRC32
+        primary_gpt.partition_table_crc32 = calculate_crc32(gpt_table, sizeof(gpt_table));
+        primary_gpt.header_crc32 = calculate_crc32(&primary_gpt, primary_gpt.header_size);
 
         // TODO: Write primary GPT header and table to file
+        if (fwrite(&primary_gpt, 1, sizeof(primary_gpt), image) != sizeof(primary_gpt))
+        {
+            return false;
+        }
+        write_full_lba_size(image); //fills rest of lba
+
+        if (fwrite(&gpt_table, 1, sizeof(gpt_table), image) != sizeof(gpt_table))
+        {
+            return false;
+        }
 
         // TODO: Fill out secondary GPT header
+        Gpt_Header secondary_gpt = primary_gpt;
+        secondary_gpt.partition_table_lba = image_size_lbas - 1 - 32;
+        secondary_gpt.partition_table_crc32 = 0;
+        secondary_gpt.header_crc32 = 0;
+        secondary_gpt.my_lba = image_size_lbas - 1;
+        secondary_gpt.alternate_lba = primary_gpt.my_lba;
+
+        secondary_gpt.partition_table_crc32 = calculate_crc32(gpt_table, sizeof(gpt_table));
+        secondary_gpt.header_crc32 = calculate_crc32(&secondary_gpt, secondary_gpt.header_size);
 
         // TODO: Go to positon of seconday table
+        fseek(image, (secondary_gpt.partition_table_lba * lba_size), SEEK_SET);
 
         // TODO : Write secondary gpt table to file
+        if (fwrite(&gpt_table, 1, sizeof(gpt_table), image) != sizeof(gpt_table))
+        {
+            return false;
+        }
 
         // TODO : Write secondary gpt header to file
+        if (fwrite(&secondary_gpt, 1, sizeof(secondary_gpt), image) != sizeof(secondary_gpt))
+        {
+            return false;
+        }
+        write_full_lba_size(image); //fills rest of lba
 
         return true;
 
@@ -285,8 +318,11 @@ int main(void)
         return EXIT_FAILURE;
     }
 
+    //Allignemnt for GPT tables is 1MB, so make sure the image size is a multiple of 1MB
+    const uint64_t padding = (ALIGNMENT*2 + (lba_size* 67));
+
     //Set sizes
-    image_size = esp_size + data_size + (1024*1024); // Add some extra padding for GPT
+    image_size = esp_size + data_size + padding; // Add some extra padding for GPT
     image_size_lbas = bytes_to_lbas(image_size);
     align_lba = ALIGNMENT / lba_size;
     esp_lba = align_lba; //ESP starts after alignment
