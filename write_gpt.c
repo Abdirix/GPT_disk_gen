@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <time.h>
+#include <string.h>
 #include <uchar.h> //for UCS-2 (UTF-16) string support
 //NOTE: This code is written for 512 byte sectors, and will not work for 4096 byte sectors without modification
 
@@ -92,7 +93,7 @@ typedef struct {
     uint8_t BS_DrvNum;
     uint8_t BS_Reserved1;
     uint8_t BS_BootSig;
-    uint32_t BS_VolID[4];
+    uint32_t BS_VolID;
     uint8_t BS_VolLab[11];
     uint8_t BS_FilSysType[8];
 
@@ -100,6 +101,89 @@ typedef struct {
     uint8_t boot_code[510-90];
     uint16_t bootsect_sig; //boot sector signature 0xAA55
  } __attribute__((packed)) Fat32_Vbr;
+
+ typedef struct {
+    uint32_t FSI_LeadSig;
+    uint8_t FSI_Reserved1[480];
+    uint32_t FSI_StructSig;
+    uint32_t FSI_Free_Count;
+    uint32_t FSI_Nxt_Free;
+    uint8_t FSI_Reserved2[12];
+    uint32_t FSI_TrailSig;
+ }__attribute__((packed)) FSInfo;
+
+ typedef struct {
+    uint8_t  DIR_Name[11];
+    uint8_t  DIR_Attr;
+    uint8_t  DIR_NTRes;
+    uint8_t  DIR_CrtTimeTenth;
+    uint16_t DIR_CrtTime;
+    uint16_t DIR_CrtDate;
+    uint16_t DIR_LstAccDate;
+    uint16_t DIR_FstClusHI;
+    uint16_t DIR_WrtTime;
+    uint16_t DIR_WrtDate;
+    uint16_t DIR_FstClusLO;
+    uint32_t DIR_FileSize;
+ }__attribute__((packed)) FAT32_Dir_Entry_Short;
+
+ // FAT32 Directory Entry Attributes
+typedef enum {
+    ATTR_READ_ONLY = 0x01,
+    ATTR_HIDDEN    = 0x02,
+    ATTR_SYSTEM    = 0x04,
+    ATTR_VOLUME_ID = 0x08,
+    ATTR_DIRECTORY = 0x10,
+    ATTR_ARCHIVE   = 0x20,
+    ATTR_LONG_NAME = ATTR_READ_ONLY | ATTR_HIDDEN |
+                     ATTR_SYSTEM    | ATTR_VOLUME_ID,
+} FAT32_Dir_Attr;
+
+
+// FAT32 File "types"
+typedef enum {
+    TYPE_DIR,   // Directory
+    TYPE_FILE,  // Regular file
+} File_Type;
+
+// Common Virtual Hard Disk Footer, for a "fixed" vhd
+// All fields are in network byte order (Big Endian),
+//   since I'm lazy or otherwise a bad programmer,
+//   we'll use byte arrays here
+typedef struct {
+    uint8_t cookie[8];
+    uint8_t features[4];
+    uint8_t version[4];
+    uint64_t data_offset;
+    uint8_t timestamp[4];
+    uint8_t creator_app[4];
+    uint8_t creator_ver[4];
+    uint8_t creator_OS[4];
+    uint8_t original_size[8];
+    uint8_t current_size[8];
+    uint8_t disk_geometry[4];
+    uint8_t disk_type[4];
+    uint8_t checksum[4];
+    GUID unique_id;
+    uint8_t saved_state;
+    uint8_t reserved[427];
+} __attribute__ ((packed)) Vhd;
+
+// Internal Options object for commandline args
+typedef struct {
+    char *image_name;
+    uint32_t lba_size;
+    uint32_t esp_size;
+    uint32_t data_size;
+    char **esp_file_paths;
+    uint32_t num_esp_file_paths;
+    FILE **esp_files;
+    char **data_files;
+    uint32_t num_data_files;
+    bool vhd;
+    bool help;
+    bool error;
+} Options;
 
  //TODO: Find out why these const are written the way they are
 
@@ -202,6 +286,17 @@ void create_crc32_table(void)
     }
 }
 
+void get_fat_dir_time_date(uint16_t *in_time, uint16_t *in_date)
+{
+    time_t curr_time = time(NULL);
+    struct tm tm= *localtime(&curr_time);
+
+
+    *in_date = ((tm.tm_year - 80) << 9) | ((tm.tm_mon + 1) << 5) | tm.tm_mday;
+    *in_time = (tm.tm_hour << 11) | (tm.tm_min << 5) | (tm.tm_sec / 2);
+
+}
+
 uint32_t calculate_crc32(void *buf, int32_t length)
 {
     static bool made_crc_table = false;
@@ -282,7 +377,7 @@ bool write_gpts(FILE *image)
             .starting_lba = esp_lba,
             .ending_lba = esp_lba + esp_size_lbas - 1,
             .attributes = 0,
-            .name = u"EFI SYSTEM",
+            .name = {'E', 'F', 'I', ' ', 'S', 'Y', 'S', 'T', 'E', 'M'},
         },
 
         //Basic Data Partition
@@ -296,7 +391,7 @@ bool write_gpts(FILE *image)
         },
     };
 
-        // TODO: Fill out primary header CRC32
+        // Fill out primary header CRC32
         primary_gpt.partition_table_crc32 = calculate_crc32(gpt_table, sizeof(gpt_table));
         primary_gpt.header_crc32 = calculate_crc32(&primary_gpt, primary_gpt.header_size);
 
@@ -347,9 +442,9 @@ bool write_gpts(FILE *image)
 bool write_esp(FILE *image)
 {
     //Reserved sector region -------------------------------
-    //TODO: Write ESP system partition with FAT32 filesystem
+    //Write ESP system partition with FAT32 filesystem
     const uint8_t reserved_sectors = 32; //FAT32 spec says this should be at least 32 sectors, but can be more
-    FAT32_Vbr vbr = {
+    Fat32_Vbr vbr = {
         .BS_jmpBoot = { 0xEB, 0x58, 0x90 }, //Jump instruction to boot code
         .BS_OEMName = { 'M', 'S', 'W', 'I', 'N', '4', '.', '1' },
         .BPB_BytsPerSec = lba_size, //Bytes per sector (Can be changed 512/1024/2048/4096)
@@ -362,30 +457,165 @@ bool write_esp(FILE *image)
         .BPB_FATSz16 = 0, //FAT32 doesn't use this
         .BPB_SecPerTrk = 0, //TODO: Calculate this properly
         .BPB_NumHeads = 0, //TODO: Calculate this properly
-        .BPB_HiddSec = esp_lba - 1, //num of sectors before this partition (MBR + GPT header + GPT table)
+        .BPB_HiddSec = esp_lba, //num of sectors before this partition (MBR + GPT header + GPT table)
         .BPB_TotSec32 = esp_size_lbas, //Total number of sectors
         .BPB_FATSz32 = (align_lba - reserved_sectors) / 2, //TODO: Calculate this properly
         .BPB_ExtFlags = 0, //Mirrored FATs, active FAT is FAT0
         .BPB_FSVer = 0, //FAT32 version 0.0
         .BPB_RootClus = 2, //Root directory starts at cluster 2
-        
+        .BPB_FSInfo = 1, //Sector 0 = this VBR
+        .BPB_BkBootSec = 6,
+        .BPB_Reserved = { 0 },
+        .BS_DrvNum = 0x80, //1st drive
+        .BS_Reserved1 = 0,
+        .BS_BootSig = 0x29,
+        .BS_VolID = 0,
+        .BS_VolLab = { "NO NAME    "}, // Currently no volume label TODO: Add a volume label
+        .BS_FilSysType = {"FAT32   "}, 
 
-
+        .boot_code = { 0 },
+        .bootsect_sig = 0xAA55,
 
 
     };
 
-    // TODO: Fill out file system info sector
+    // Fill out file system info sector
+    FSInfo fsinfo ={
+        .FSI_LeadSig = 0x41615252,
+        .FSI_Reserved1 = { 0 },
+        .FSI_StructSig = 0x61417272,
+        .FSI_Free_Count = 0xFFFFFFF, //Test
+        .FSI_Nxt_Free = 0xFFFFFFFF, //Test
+        .FSI_Reserved2 = { 0 },
+        .FSI_TrailSig = 0xAA550000,
+    };
 
-    //TODO: Write VBR and FSInfo
+    //Write VBR and FSInfo
+    fseek(image, esp_lba * lba_size, SEEK_SET);
+    if (fwrite(&vbr, 1, sizeof(vbr), image) != sizeof(vbr))
+    {
+        fprintf(stdout, "Error: VBR didn't write to img\n");
+        return false;
+    }
+    write_full_lba_size(image);
 
-    //TODO: go to backup boot sector location
+
+    if (fwrite(&fsinfo, 1, sizeof(fsinfo), image) != sizeof(fsinfo))
+    {
+        fprintf(stdout, "Error: FSInfo didn't write to img\n");
+        return false;
+    }
+    write_full_lba_size(image);
+
+
+    //go to backup boot sector location
+    fseek(image, (esp_lba + vbr.BPB_BkBootSec) * lba_size, SEEK_SET);
+
+    if (fwrite(&vbr, 1, sizeof(vbr), image) != sizeof(vbr))
+    {
+        fprintf(stdout, "Error: VBR didn't write to img\n");
+        return false;
+    }
+    write_full_lba_size(image);
+
+    if (fwrite(&fsinfo, 1, sizeof(fsinfo), image) != sizeof(fsinfo))
+    {
+        fprintf(stdout, "Error: FSInfo didn't write to img\n");
+        return false;
+    }
+    write_full_lba_size(image);
+
 
     //FAT region -------------------------------
     //TODO: Write FATs
+    fseek(image, (esp_lba + vbr.BPB_RsvdSecCnt) * lba_size, SEEK_SET);
+    const uint32_t fat_lba = esp_lba + vbr.BPB_RsvdSecCnt;
+    for (uint8_t i = 0; i < vbr.BPB_NumFATs; i++)
+    {
+        fseek(image, (fat_lba + (i * vbr.BPB_FATSz32)) * lba_size, SEEK_SET);
+
+        uint32_t cluster = 0;
+
+        //Cluster 1, FAT indicator, lowest 8 bits are media byte
+        cluster = 0xFFFFFF00 | vbr.BPB_Media;
+        fwrite(&cluster, sizeof(cluster), 1, image);
+
+        //EOC marker (Cluster 2)
+        cluster = 0xFFFFFFFF;
+        fwrite(&cluster, sizeof(cluster), 1, image);
+
+        //Cluster 3 Root dir cluster start
+        cluster = 0xFFFFFFFF;
+        fwrite(&cluster, sizeof(cluster), 1, image);
+
+        //Cluster 4 '/EFI' dir cluster
+        cluster = 0xFFFFFFFF;
+        fwrite(&cluster, sizeof(cluster), 1, image);
+
+        //Cluster 5+ Other files/dirs
+        cluster = 6; //Points to next cluster with file data
+        cluster = 0xFFFFFFFF; //indicates no more file data after this cluster
+    }
 
     //Data region -------------------------------
-    //TODO: Write File data
+    //Write File data
+    const uint32_t data_lba = fat_lba + (vbr.BPB_NumFATs * vbr.BPB_FATSz32);
+    fseek(image, data_lba * lba_size, SEEK_SET);
+
+    //TODO Root '/' Dir
+    FAT32_Dir_Entry_Short dir_ent = {
+        .DIR_Name = {"EFI        "},
+        .DIR_Attr = ATTR_DIRECTORY,
+        .DIR_NTRes = 0,
+        .DIR_CrtTimeTenth = 0,
+        .DIR_CrtTime = 0,
+        .DIR_CrtDate = 0,
+        .DIR_LstAccDate = 0,
+        .DIR_FstClusHI = 0, //Hopefully should always be 0
+        .DIR_WrtTime = 0,
+        .DIR_WrtDate = 0,
+        .DIR_FstClusLO = 3,
+        .DIR_FileSize = 0,
+
+    };
+
+    uint16_t time = 0;
+    uint16_t date = 0;
+    get_fat_dir_time_date(&time, &date);
+
+    dir_ent.DIR_CrtTime = time;
+    dir_ent.DIR_CrtDate = date;
+    dir_ent.DIR_WrtTime = time;
+    dir_ent.DIR_WrtDate = date;
+
+    fwrite(&dir_ent, sizeof(dir_ent), 1, image);
+
+    //TODO /EFI Dir
+    fseek(image, (data_lba + 1) * lba_size, SEEK_SET);
+    memcpy(dir_ent.DIR_Name, ".          ", 11);
+    fwrite(&dir_ent, sizeof(dir_ent), 1, image);
+
+    memcpy(dir_ent.DIR_Name, "..         ", 11);
+    dir_ent.DIR_FstClusLO = 0;
+    fwrite(&dir_ent, sizeof(dir_ent), 1, image);
+
+    memcpy(dir_ent.DIR_Name, "BOOT       ", 11);
+    dir_ent.DIR_FstClusLO = 4;
+    fwrite(&dir_ent, sizeof(dir_ent), 1, image);
+
+    //TODO /EFI/BOOT Dir
+    fseek(image, (data_lba + 2) * lba_size, SEEK_SET);
+
+    memcpy(dir_ent.DIR_Name, ".          ", 11);
+    fwrite(&dir_ent, sizeof(dir_ent), 1, image);
+
+    memcpy(dir_ent.DIR_Name, "..         ", 11);
+    dir_ent.DIR_FstClusLO = 3;
+    fwrite(&dir_ent, sizeof(dir_ent), 1, image);
+
+    
+
+
     return true;
 }
 
@@ -432,6 +662,12 @@ int main(void)
 
     //TODO: Write ESP system partiton with FAT32 filesystem
 
+    if (!write_esp(image))
+    {
+        fprintf(stderr, "Error: could not write ESP for file %s\n", image_name);
+        return EXIT_FAILURE;
+    }
+
     return EXIT_SUCCESS;
-    
+
 }

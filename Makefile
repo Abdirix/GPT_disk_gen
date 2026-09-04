@@ -10,3 +10,4 @@ all: $(TARGET)
 
 clean:
 	rm -f $(TARGET) *.img
+	rm -f *.txt
